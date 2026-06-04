@@ -1,15 +1,23 @@
 #include "ext.h"
 #include "ext_obex.h"
+#include "z_dsp.h"
 #include "buffer.h"
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
 
-#define FFT_SIZE    1024
-#define HOP_SIZE    512
-#define PEAK_WINDOW 10
-#define PEAK_THRESH 0.25
-#define MAX_ITER    100
+#define FFT_SIZE     1024
+#define HOP_SIZE     512
+#define PEAK_WINDOW  10
+#define PEAK_THRESH  0.25
+#define MAX_ITER     100
+#define N_MFCC       13
+#define N_FILTERS    26
+#define MAX_SEGMENTS 4096
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
 
 void fft(double *re, double *im, int n) {
     int i, j, k, m;
@@ -26,7 +34,7 @@ void fft(double *re, double *im, int n) {
         }
     }
     for (m = 2; m <= n; m <<= 1) {
-        double angle = -2.0 * 3.14159265358979323846 / m;
+        double angle = -2.0 * M_PI / m;
         w_re = cos(angle); w_im = sin(angle);
         for (k = 0; k < n; k += m) {
             u_re = 1.0; u_im = 0.0;
@@ -45,13 +53,66 @@ void fft(double *re, double *im, int n) {
     }
 }
 
+double hz_to_mel(double hz) { return 2595.0 * log10(1.0 + hz / 700.0); }
+double mel_to_hz(double mel) { return 700.0 * (pow(10.0, mel / 2595.0) - 1.0); }
+
+void build_mel_filterbank(double *fb, double sr) {
+    int n_fft_bins = FFT_SIZE / 2 + 1;
+    double mel_min = hz_to_mel(0.0);
+    double mel_max = hz_to_mel(sr / 2.0);
+    double mel_points[N_FILTERS + 2];
+    int    bin_points[N_FILTERS + 2];
+    int f, i;
+    for (f = 0; f < N_FILTERS + 2; f++) {
+        mel_points[f] = mel_min + (mel_max - mel_min) * f / (N_FILTERS + 1);
+        bin_points[f] = (int)floor((FFT_SIZE + 1) * mel_to_hz(mel_points[f]) / sr);
+    }
+    memset(fb, 0, N_FILTERS * n_fft_bins * sizeof(double));
+    for (f = 0; f < N_FILTERS; f++) {
+        int start = bin_points[f];
+        int mid   = bin_points[f + 1];
+        int end   = bin_points[f + 2];
+        for (i = start; i < mid; i++)
+            if (i < n_fft_bins)
+                fb[f * n_fft_bins + i] = (double)(i - start) / (mid - start);
+        for (i = mid; i < end; i++)
+            if (i < n_fft_bins)
+                fb[f * n_fft_bins + i] = (double)(end - i) / (end - mid);
+    }
+}
+
+void compute_mfcc(double *mag, double *fb, double *mfcc, int n_fft_bins) {
+    double log_energies[N_FILTERS];
+    int f, c;
+    for (f = 0; f < N_FILTERS; f++) {
+        double energy = 0.0;
+        int i;
+        for (i = 0; i < n_fft_bins; i++)
+            energy += fb[f * n_fft_bins + i] * mag[i];
+        log_energies[f] = log(energy + 1e-10);
+    }
+    for (c = 0; c < N_MFCC; c++) {
+        double sum = 0.0;
+        for (f = 0; f < N_FILTERS; f++)
+            sum += log_energies[f] * cos(M_PI * c * (f + 0.5) / N_FILTERS);
+        mfcc[c] = sum;
+    }
+}
+
 typedef struct _soundtypes {
-    t_object  ob;
-    t_symbol *buf_name;
-    double    ratio;
-    long      num_clusters;
-    void     *outlet_segments;  // outputs segment info
-    void     *outlet_markov;    // outputs markov transitions
+    t_pxobject  ob;
+    t_symbol   *buf_name;
+    long        num_clusters;
+    double     *corpus_mfcc;
+    long       *seg_starts;
+    long       *seg_ends;
+    int        *seg_labels;
+    int         num_segments;
+    int         corpus_ready;
+    double     *filterbank;
+    double      samplerate;
+    void       *outlet_pos;
+    void       *outlet_info;
 } t_soundtypes;
 
 void *soundtypes_new(t_symbol *s, long argc, t_atom *argv);
@@ -60,68 +121,85 @@ void soundtypes_assist(t_soundtypes *x, void *b, long m, long a, char *s);
 void soundtypes_bang(t_soundtypes *x);
 void soundtypes_set(t_soundtypes *x, t_symbol *s);
 void soundtypes_clusters(t_soundtypes *x, long n);
+void soundtypes_dsp64(t_soundtypes *x, t_object *dsp64, short *count, double samplerate, long maxvectorsize, long flags);
+void soundtypes_perform64(t_soundtypes *x, t_object *dsp64, double **ins, long numins, double **outs, long numouts, long sampleframes, long flags, void *userparam);
 
 static t_class *soundtypes_class;
 
 void ext_main(void *r) {
     t_class *c;
-    c = class_new("soundtypes", 
-                  (method)soundtypes_new, 
-                  (method)soundtypes_free, 
-                  sizeof(t_soundtypes), 
+    c = class_new("soundtypes~",
+                  (method)soundtypes_new,
+                  (method)soundtypes_free,
+                  sizeof(t_soundtypes),
                   0L, A_GIMME, 0);
     class_addmethod(c, (method)soundtypes_bang,     "bang",     0);
     class_addmethod(c, (method)soundtypes_set,      "set",      A_SYM,  0);
     class_addmethod(c, (method)soundtypes_clusters, "clusters", A_LONG, 0);
     class_addmethod(c, (method)soundtypes_assist,   "assist",   A_CANT, 0);
+    class_addmethod(c, (method)soundtypes_dsp64,    "dsp64",    A_CANT, 0);
+    class_dspinit(c);
     class_register(CLASS_BOX, c);
     soundtypes_class = c;
-    post("soundtypes: ready");
+    post("soundtypes~: ready");
 }
 
 void *soundtypes_new(t_symbol *s, long argc, t_atom *argv) {
     t_soundtypes *x = (t_soundtypes *)object_alloc(soundtypes_class);
     if (x) {
+        dsp_setup((t_pxobject *)x, 1);
         x->buf_name     = gensym("");
-        x->ratio        = 0.1;
         x->num_clusters = 3;
-        // outlets are created right to left
-        x->outlet_markov   = outlet_new((t_object *)x, NULL);
-        x->outlet_segments = outlet_new((t_object *)x, NULL);
-        post("soundtypes: new instance created");
+        x->corpus_mfcc  = NULL;
+        x->seg_starts   = NULL;
+        x->seg_ends     = NULL;
+        x->seg_labels   = NULL;
+        x->num_segments = 0;
+        x->corpus_ready = 0;
+        x->samplerate   = 44100.0;
+        x->filterbank   = (double *)malloc(N_FILTERS * (FFT_SIZE/2+1) * sizeof(double));
+        build_mel_filterbank(x->filterbank, x->samplerate);
+        x->outlet_info  = outlet_new((t_object *)x, NULL);
+        x->outlet_pos   = outlet_new((t_object *)x, NULL);
+        post("soundtypes~: new instance created");
     }
     return x;
 }
 
-void soundtypes_free(t_soundtypes *x) {}
+void soundtypes_free(t_soundtypes *x) {
+    dsp_free((t_pxobject *)x);
+    if (x->corpus_mfcc) free(x->corpus_mfcc);
+    if (x->seg_starts)  free(x->seg_starts);
+    if (x->seg_ends)    free(x->seg_ends);
+    if (x->seg_labels)  free(x->seg_labels);
+    if (x->filterbank)  free(x->filterbank);
+}
 
 void soundtypes_assist(t_soundtypes *x, void *b, long m, long a, char *s) {
     if (m == ASSIST_INLET)
-        sprintf(s, "bang to analyse | set <buffer> | clusters <n>");
+        sprintf(s, "signal: live audio | bang: analyse corpus | set <buffer> | clusters <n>");
     else if (a == 0)
-        sprintf(s, "segment info: time type start_sample end_sample");
+        sprintf(s, "matched segment: start_sample end_sample");
     else
-        sprintf(s, "markov: from_type to_type probability");
+        sprintf(s, "match info: index cluster distance");
 }
 
 void soundtypes_set(t_soundtypes *x, t_symbol *s) {
     x->buf_name = s;
-    post("soundtypes: buffer set to '%s'", s->s_name);
+    post("soundtypes~: corpus buffer set to '%s'", s->s_name);
 }
 
 void soundtypes_clusters(t_soundtypes *x, long n) {
     if (n < 1) n = 1;
     x->num_clusters = n;
-    post("soundtypes: clusters set to %ld", n);
+    post("soundtypes~: clusters set to %ld", n);
 }
 
 void soundtypes_bang(t_soundtypes *x) {
     if (x->buf_name == gensym("")) {
-        object_error((t_object *)x, "no buffer set — use [set <buffername>]");
+        object_error((t_object *)x, "no corpus buffer set");
         return;
     }
-
-    // --- open buffer ---
     t_buffer_ref *ref = buffer_ref_new((t_object *)x, x->buf_name);
     t_buffer_obj *buf = buffer_ref_getobject(ref);
     if (!buf) {
@@ -138,9 +216,13 @@ void soundtypes_bang(t_soundtypes *x) {
 
     long   num_samples  = buffer_getframecount(buf);
     long   num_channels = buffer_getchannelcount(buf);
-    double samplerate   = buffer_getsamplerate(buf);
+    double sr           = buffer_getsamplerate(buf);
 
-    // --- mono mixdown ---
+    if (sr != x->samplerate) {
+        x->samplerate = sr;
+        build_mel_filterbank(x->filterbank, sr);
+    }
+
     double *mono = (double *)malloc(num_samples * sizeof(double));
     long i;
     for (i = 0; i < num_samples; i++) {
@@ -153,42 +235,46 @@ void soundtypes_bang(t_soundtypes *x) {
     buffer_unlocksamples(buf);
     object_free(ref);
 
-    // --- spectral flux ---
     int num_frames = (num_samples - FFT_SIZE) / HOP_SIZE;
-    double *flux     = (double *)malloc(num_frames * sizeof(double));
-    double *re       = (double *)malloc(FFT_SIZE * sizeof(double));
-    double *im       = (double *)malloc(FFT_SIZE * sizeof(double));
-    double *prev_mag = (double *)malloc((FFT_SIZE/2) * sizeof(double));
+    int n_fft_bins = FFT_SIZE / 2 + 1;
+    double *flux       = (double *)malloc(num_frames * sizeof(double));
+    double *re         = (double *)malloc(FFT_SIZE * sizeof(double));
+    double *im         = (double *)malloc(FFT_SIZE * sizeof(double));
+    double *prev_mag   = (double *)malloc(n_fft_bins * sizeof(double));
+    double *frame_mfcc = (double *)malloc(num_frames * N_MFCC * sizeof(double));
+    double *mag        = (double *)malloc(n_fft_bins * sizeof(double));
 
-    for (i = 0; i < FFT_SIZE/2; i++) prev_mag[i] = 0.0;
+    for (i = 0; i < n_fft_bins; i++) prev_mag[i] = 0.0;
 
     int frame;
     for (frame = 0; frame < num_frames; frame++) {
         int start = frame * HOP_SIZE;
         for (i = 0; i < FFT_SIZE; i++) {
-            double window = 0.5 * (1.0 - cos(2.0 * 3.14159265358979323846 * i / (FFT_SIZE - 1)));
+            double window = 0.5 * (1.0 - cos(2.0 * M_PI * i / (FFT_SIZE - 1)));
             re[i] = mono[start + i] * window;
             im[i] = 0.0;
         }
         fft(re, im, FFT_SIZE);
+        for (i = 0; i < n_fft_bins; i++)
+            mag[i] = sqrt(re[i]*re[i] + im[i]*im[i]);
         double f = 0.0;
-        for (i = 0; i < FFT_SIZE/2; i++) {
-            double mag = sqrt(re[i]*re[i] + im[i]*im[i]);
-            double diff = mag - prev_mag[i];
+        for (i = 0; i < n_fft_bins; i++) {
+            double diff = mag[i] - prev_mag[i];
             if (diff > 0) f += diff;
-            prev_mag[i] = mag;
+            prev_mag[i] = mag[i];
         }
         flux[frame] = f;
+        compute_mfcc(mag, x->filterbank, frame_mfcc + frame * N_MFCC, n_fft_bins);
     }
-    free(re); free(im); free(prev_mag);
+    free(re); free(im); free(prev_mag); free(mag);
 
-    // --- peak picking ---
     double max_flux = 0.0;
     for (frame = 0; frame < num_frames; frame++)
         if (flux[frame] > max_flux) max_flux = flux[frame];
 
     int *peak_list = (int *)malloc(num_frames * sizeof(int));
     int  num_peaks = 0;
+    peak_list[num_peaks++] = 0;
 
     for (frame = PEAK_WINDOW; frame < num_frames - PEAK_WINDOW; frame++) {
         if (flux[frame] < PEAK_THRESH * max_flux) continue;
@@ -197,106 +283,161 @@ void soundtypes_bang(t_soundtypes *x) {
             if (w == 0) continue;
             if (flux[frame + w] >= flux[frame]) { is_peak = 0; break; }
         }
-        if (is_peak) peak_list[num_peaks++] = frame;
+        if (is_peak && num_peaks < MAX_SEGMENTS)
+            peak_list[num_peaks++] = frame;
     }
     free(flux);
 
     if (num_peaks < 2) {
         object_error((t_object *)x, "not enough segments found");
-        free(mono); free(peak_list);
+        free(mono); free(frame_mfcc); free(peak_list);
         return;
     }
 
-    // --- features: RMS per segment ---
     int K = (int)x->num_clusters;
     if (K > num_peaks) K = num_peaks;
 
-    double *features    = (double *)malloc(num_peaks * sizeof(double));
-    long   *seg_starts  = (long *)malloc(num_peaks * sizeof(long));
-    long   *seg_ends    = (long *)malloc(num_peaks * sizeof(long));
+    if (x->corpus_mfcc) { free(x->corpus_mfcc); x->corpus_mfcc = NULL; }
+    if (x->seg_starts)  { free(x->seg_starts);  x->seg_starts  = NULL; }
+    if (x->seg_ends)    { free(x->seg_ends);     x->seg_ends    = NULL; }
+    if (x->seg_labels)  { free(x->seg_labels);   x->seg_labels  = NULL; }
+
+    x->corpus_mfcc = (double *)malloc(num_peaks * N_MFCC * sizeof(double));
+    x->seg_starts  = (long *)malloc(num_peaks * sizeof(long));
+    x->seg_ends    = (long *)malloc(num_peaks * sizeof(long));
+    x->seg_labels  = (int *)malloc(num_peaks * sizeof(int));
 
     for (i = 0; i < num_peaks; i++) {
-        seg_starts[i] = peak_list[i] * HOP_SIZE;
-        seg_ends[i]   = (i + 1 < num_peaks) ? peak_list[i+1] * HOP_SIZE : num_samples;
-        double rms = 0.0;
-        long j;
-        for (j = seg_starts[i]; j < seg_ends[i]; j++)
-            rms += mono[j] * mono[j];
-        features[i] = sqrt(rms / (seg_ends[i] - seg_starts[i]));
+        int f_start = peak_list[i];
+        int f_end   = (i + 1 < num_peaks) ? peak_list[i+1] : num_frames - 1;
+        x->seg_starts[i] = (long)f_start * HOP_SIZE;
+        x->seg_ends[i]   = (long)f_end   * HOP_SIZE;
+        double *seg_mfcc = x->corpus_mfcc + i * N_MFCC;
+        int c;
+        for (c = 0; c < N_MFCC; c++) seg_mfcc[c] = 0.0;
+        int count = f_end - f_start;
+        if (count < 1) count = 1;
+        for (frame = f_start; frame < f_end; frame++)
+            for (c = 0; c < N_MFCC; c++)
+                seg_mfcc[c] += frame_mfcc[frame * N_MFCC + c];
+        for (c = 0; c < N_MFCC; c++) seg_mfcc[c] /= count;
     }
-    free(mono);
+    free(frame_mfcc); free(mono);
 
-    // --- KMeans ---
-    double *centroids = (double *)malloc(K * sizeof(double));
-    int    *labels    = (int *)calloc(num_peaks, sizeof(int));
-
+    double *centroids = (double *)malloc(K * N_MFCC * sizeof(double));
+    memset(x->seg_labels, 0, num_peaks * sizeof(int));
     for (i = 0; i < K; i++)
-        centroids[i] = features[i * (num_peaks / K)];
+        memcpy(centroids + i * N_MFCC, x->corpus_mfcc + i * N_MFCC, N_MFCC * sizeof(double));
 
-    int iter, changed;
+    int iter;
     for (iter = 0; iter < MAX_ITER; iter++) {
-        changed = 0;
+        int changed = 0;
         for (i = 0; i < num_peaks; i++) {
-            int best = 0; int k;
-            double best_dist = fabs(features[i] - centroids[0]);
-            for (k = 1; k < K; k++) {
-                double dist = fabs(features[i] - centroids[k]);
+            double *feat = x->corpus_mfcc + i * N_MFCC;
+            int best = 0, k, c;
+            double best_dist = 1e18;
+            for (k = 0; k < K; k++) {
+                double dist = 0.0;
+                for (c = 0; c < N_MFCC; c++) {
+                    double d = feat[c] - centroids[k * N_MFCC + c];
+                    dist += d * d;
+                }
                 if (dist < best_dist) { best_dist = dist; best = k; }
             }
-            if (labels[i] != best) { labels[i] = best; changed++; }
+            if (x->seg_labels[i] != best) { x->seg_labels[i] = best; changed++; }
         }
         if (!changed) break;
-        double *sums   = (double *)calloc(K, sizeof(double));
+        double *sums   = (double *)calloc(K * N_MFCC, sizeof(double));
         int    *counts = (int *)calloc(K, sizeof(int));
         for (i = 0; i < num_peaks; i++) {
-            sums[labels[i]]   += features[i];
-            counts[labels[i]] ++;
+            int k = x->seg_labels[i];
+            int c;
+            for (c = 0; c < N_MFCC; c++)
+                sums[k * N_MFCC + c] += x->corpus_mfcc[i * N_MFCC + c];
+            counts[k]++;
         }
         int k;
-        for (k = 0; k < K; k++)
-            if (counts[k] > 0) centroids[k] = sums[k] / counts[k];
+        for (k = 0; k < K; k++) {
+            if (counts[k] > 0) {
+                int c;
+                for (c = 0; c < N_MFCC; c++)
+                    centroids[k * N_MFCC + c] = sums[k * N_MFCC + c] / counts[k];
+            }
+        }
         free(sums); free(counts);
     }
-    free(features); free(centroids);
+    free(centroids);
 
-    // --- output segments from left outlet ---
-    // format: segment <index> <time_ms> <type> <start_sample> <end_sample>
-    for (i = 0; i < num_peaks; i++) {
-        t_atom av[5];
-        double time_ms = (seg_starts[i] / samplerate) * 1000.0;
-        atom_setlong (av,   i);
-        atom_setfloat(av+1, time_ms);
-        atom_setlong (av+2, labels[i]);
-        atom_setlong (av+3, seg_starts[i]);
-        atom_setlong (av+4, seg_ends[i]);
-        outlet_anything(x->outlet_segments, gensym("segment"), 5, av);
-    }
+    x->num_segments = num_peaks;
+    x->corpus_ready = 1;
+    post("soundtypes~: corpus ready — %d segments, %d clusters, %d iterations",
+         num_peaks, K, iter);
+    free(peak_list);
+}
 
-    // --- build Markov chain ---
-    // count transitions between cluster types
-    int *trans = (int *)calloc(K * K, sizeof(int));
-    for (i = 0; i < num_peaks - 1; i++)
-        trans[labels[i] * K + labels[i+1]]++;
+void soundtypes_dsp64(t_soundtypes *x, t_object *dsp64, short *count, double samplerate, long maxvectorsize, long flags) {
+    x->samplerate = samplerate;
+    build_mel_filterbank(x->filterbank, samplerate);
+    object_method(dsp64, gensym("dsp_add64"), x, soundtypes_perform64, 0, NULL);
+}
 
-    // normalise and output from right outlet
-    // format: markov <from_type> <to_type> <probability>
-    int from, to;
-    for (from = 0; from < K; from++) {
-        int total = 0;
-        for (to = 0; to < K; to++)
-            total += trans[from * K + to];
-        if (total == 0) continue;
-        for (to = 0; to < K; to++) {
-            if (trans[from * K + to] == 0) continue;
-            t_atom av[3];
-            atom_setlong (av,   from);
-            atom_setlong (av+1, to);
-            atom_setfloat(av+2, (double)trans[from * K + to] / total);
-            outlet_anything(x->outlet_markov, gensym("markov"), 3, av);
+static double live_buf[FFT_SIZE];
+static int    live_buf_pos  = 0;
+static int    live_hop_count = 0;
+
+void soundtypes_perform64(t_soundtypes *x, t_object *dsp64, double **ins, long numins, double **outs, long numouts, long sampleframes, long flags, void *userparam) {
+    double *in = ins[0];
+    long n = sampleframes;
+    int n_fft_bins = FFT_SIZE / 2 + 1;
+
+    if (!x->corpus_ready) return;
+
+    long s;
+    for (s = 0; s < n; s++) {
+        live_buf[live_buf_pos++] = in[s];
+
+        if (live_buf_pos >= HOP_SIZE) {
+            live_buf_pos = 0;
+            live_hop_count++;
+            if (live_hop_count % 2 != 0) continue;
+
+            double re[FFT_SIZE], im[FFT_SIZE];
+            int i;
+            for (i = 0; i < FFT_SIZE; i++) {
+                double window = 0.5 * (1.0 - cos(2.0 * M_PI * i / (FFT_SIZE - 1)));
+                re[i] = live_buf[i % HOP_SIZE] * window;
+                im[i] = 0.0;
+            }
+            fft(re, im, FFT_SIZE);
+
+            double mag[FFT_SIZE/2+1];
+            for (i = 0; i < n_fft_bins; i++)
+                mag[i] = sqrt(re[i]*re[i] + im[i]*im[i]);
+
+            double live_mfcc[N_MFCC];
+            compute_mfcc(mag, x->filterbank, live_mfcc, n_fft_bins);
+
+            int best_seg = 0, j, c;
+            double best_dist = 1e18;
+            for (j = 0; j < x->num_segments; j++) {
+                double dist = 0.0;
+                for (c = 0; c < N_MFCC; c++) {
+                    double d = live_mfcc[c] - x->corpus_mfcc[j * N_MFCC + c];
+                    dist += d * d;
+                }
+                if (dist < best_dist) { best_dist = dist; best_seg = j; }
+            }
+
+            t_atom pos_av[2];
+            atom_setlong(pos_av,   x->seg_starts[best_seg]);
+            atom_setlong(pos_av+1, x->seg_ends[best_seg]);
+            outlet_anything(x->outlet_pos, gensym("segment"), 2, pos_av);
+
+            t_atom info_av[3];
+            atom_setlong (info_av,   best_seg);
+            atom_setlong (info_av+1, x->seg_labels[best_seg]);
+            atom_setfloat(info_av+2, best_dist);
+            outlet_anything(x->outlet_info, gensym("match"), 3, info_av);
         }
     }
-
-    post("soundtypes: analysis complete — %d segments, %d types", num_peaks, K);
-    free(trans); free(labels); free(peak_list);
-    free(seg_starts); free(seg_ends);
 }
