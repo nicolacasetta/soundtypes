@@ -18,4 +18,6 @@ add_library(
     ${PROJECT_SRC}
 )
 
+set_target_properties(${PROJECT_NAME} PROPERTIES OUTPUT_NAME "soundtypes~")
+
 include(${CMAKE_CURRENT_SOURCE_DIR}/../../max-sdk-base/script/max-posttarget.cmake)
