@@ -34,13 +34,13 @@ Requires Xcode and the Max SDK.
 
 ## Messages
 
-| Message          | Description                                                        |
-|------------------|--------------------------------------------------------------------|
-| bang             | Analyse the corpus buffer — must send after set                    |
-| set name         | Set the corpus buffer~ name                                        |
-| clusters n       | Number of KMeans clusters (default: 3)                             |
-| sensitivity 0-1  | Peak picking threshold — lower = more segments (default: 0.25)     |
-| minlength ms     | Minimum segment length in milliseconds (default: 200)              |
+| Message          | Description                                                           |
+|------------------|-----------------------------------------------------------------------|
+| bang             | Analyse the corpus buffer — must send after set                       |
+| set name         | Set the corpus buffer~ name                                           |
+| clusters n       | Number of KMeans clusters (default: 3)                                |
+| sensitivity 0-1  | Peak picking threshold — lower = more segments (default: 0.25)        |
+| minlength ms     | Minimum segment length in milliseconds (default: 200)                 |
 | threshold f      | Mic energy gate — below this RMS value matching stops (default: 0.01) |
 
 ## Outlets
@@ -49,25 +49,6 @@ Requires Xcode and the Max SDK.
 |--------|-------------------------------------------------------------|
 | Left   | segment start_sample end_sample — matched segment position  |
 | Right  | match index cluster distance — match diagnostics            |
-
-## Typical patch
-
-   [adc~ 1]          [buffer~ corpus]
-       |                    |
-       |               [read]   <- click to load sound file
-       |
-   [soundtypes~]
-       |         |
-       |         +-- match info (optional)
-   [route segment]
-       |
-   [unpack 0 0]
-     |       |
-   / 44.1  / 44.1    <- samples to milliseconds
-     |       |
-   2nd     3rd inlet of [groove~ corpus]
-                 |
-             [ezdac~]
 
 ## Parameters guide
 
