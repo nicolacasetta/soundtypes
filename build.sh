@@ -19,3 +19,7 @@ echo ">>> signing..."
 codesign --force --deep --sign - ~/Documents/Max\ 9/Packages/soundtypes/externals/soundtypes~.mxo
 
 echo ">>> done — restart Max to load new version"
+
+echo ">>> updating repo binary..."
+cp -r ~/Documents/Max\ 9/Packages/soundtypes/externals/soundtypes~.mxo ~/Documents/_code/soundtypes/externals/macOS/soundtypes~.mxo
+echo ">>> repo binary updated — commit and push when ready"
