@@ -111,6 +111,7 @@ typedef struct _soundtypes {
     int         corpus_ready;
     double     *filterbank;
     double      samplerate;
+    double      threshold;      // NEW: energy threshold
     void       *outlet_pos;
     void       *outlet_info;
 } t_soundtypes;
@@ -121,6 +122,7 @@ void soundtypes_assist(t_soundtypes *x, void *b, long m, long a, char *s);
 void soundtypes_bang(t_soundtypes *x);
 void soundtypes_set(t_soundtypes *x, t_symbol *s);
 void soundtypes_clusters(t_soundtypes *x, long n);
+void soundtypes_threshold(t_soundtypes *x, double f);  // NEW
 void soundtypes_dsp64(t_soundtypes *x, t_object *dsp64, short *count, double samplerate, long maxvectorsize, long flags);
 void soundtypes_perform64(t_soundtypes *x, t_object *dsp64, double **ins, long numins, double **outs, long numouts, long sampleframes, long flags, void *userparam);
 
@@ -133,11 +135,12 @@ void ext_main(void *r) {
                   (method)soundtypes_free,
                   sizeof(t_soundtypes),
                   0L, A_GIMME, 0);
-    class_addmethod(c, (method)soundtypes_bang,     "bang",     0);
-    class_addmethod(c, (method)soundtypes_set,      "set",      A_SYM,  0);
-    class_addmethod(c, (method)soundtypes_clusters, "clusters", A_LONG, 0);
-    class_addmethod(c, (method)soundtypes_assist,   "assist",   A_CANT, 0);
-    class_addmethod(c, (method)soundtypes_dsp64,    "dsp64",    A_CANT, 0);
+    class_addmethod(c, (method)soundtypes_bang,      "bang",      0);
+    class_addmethod(c, (method)soundtypes_set,       "set",       A_SYM,   0);
+    class_addmethod(c, (method)soundtypes_clusters,  "clusters",  A_LONG,  0);
+    class_addmethod(c, (method)soundtypes_threshold, "threshold", A_FLOAT, 0);  // NEW
+    class_addmethod(c, (method)soundtypes_assist,    "assist",    A_CANT,  0);
+    class_addmethod(c, (method)soundtypes_dsp64,     "dsp64",     A_CANT,  0);
     class_dspinit(c);
     class_register(CLASS_BOX, c);
     soundtypes_class = c;
@@ -157,6 +160,7 @@ void *soundtypes_new(t_symbol *s, long argc, t_atom *argv) {
         x->num_segments = 0;
         x->corpus_ready = 0;
         x->samplerate   = 44100.0;
+        x->threshold    = 0.01;   // NEW: default threshold
         x->filterbank   = (double *)malloc(N_FILTERS * (FFT_SIZE/2+1) * sizeof(double));
         build_mel_filterbank(x->filterbank, x->samplerate);
         x->outlet_info  = outlet_new((t_object *)x, NULL);
@@ -177,7 +181,7 @@ void soundtypes_free(t_soundtypes *x) {
 
 void soundtypes_assist(t_soundtypes *x, void *b, long m, long a, char *s) {
     if (m == ASSIST_INLET)
-        sprintf(s, "signal: live audio | bang: analyse corpus | set <buffer> | clusters <n>");
+        sprintf(s, "signal: live audio | bang: analyse | set <buffer> | clusters <n> | threshold <f>");
     else if (a == 0)
         sprintf(s, "matched segment: start_sample end_sample");
     else
@@ -193,6 +197,13 @@ void soundtypes_clusters(t_soundtypes *x, long n) {
     if (n < 1) n = 1;
     x->num_clusters = n;
     post("soundtypes~: clusters set to %ld", n);
+}
+
+// NEW: set energy threshold
+void soundtypes_threshold(t_soundtypes *x, double f) {
+    if (f < 0.0) f = 0.0;
+    x->threshold = f;
+    post("soundtypes~: threshold set to %.4f", f);
 }
 
 void soundtypes_bang(t_soundtypes *x) {
@@ -382,7 +393,7 @@ void soundtypes_dsp64(t_soundtypes *x, t_object *dsp64, short *count, double sam
 }
 
 static double live_buf[FFT_SIZE];
-static int    live_buf_pos  = 0;
+static int    live_buf_pos   = 0;
 static int    live_hop_count = 0;
 
 void soundtypes_perform64(t_soundtypes *x, t_object *dsp64, double **ins, long numins, double **outs, long numouts, long sampleframes, long flags, void *userparam) {
@@ -401,8 +412,17 @@ void soundtypes_perform64(t_soundtypes *x, t_object *dsp64, double **ins, long n
             live_hop_count++;
             if (live_hop_count % 2 != 0) continue;
 
-            double re[FFT_SIZE], im[FFT_SIZE];
+            // NEW: compute RMS energy of this hop
+            double rms = 0.0;
             int i;
+            for (i = 0; i < HOP_SIZE; i++)
+                rms += live_buf[i] * live_buf[i];
+            rms = sqrt(rms / HOP_SIZE);
+
+            // NEW: skip matching if below threshold
+            if (rms < x->threshold) return;
+
+            double re[FFT_SIZE], im[FFT_SIZE];
             for (i = 0; i < FFT_SIZE; i++) {
                 double window = 0.5 * (1.0 - cos(2.0 * M_PI * i / (FFT_SIZE - 1)));
                 re[i] = live_buf[i % HOP_SIZE] * window;
