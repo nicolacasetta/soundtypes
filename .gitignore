@@ -1,5 +1,4 @@
-build/
-*.mxo
 *.o
 *.d
 .DS_Store
+build/

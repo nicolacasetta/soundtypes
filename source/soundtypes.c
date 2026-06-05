@@ -9,7 +9,6 @@
 #define FFT_SIZE     1024
 #define HOP_SIZE     512
 #define PEAK_WINDOW  10
-#define PEAK_THRESH  0.25
 #define MAX_ITER     100
 #define N_MFCC       13
 #define N_FILTERS    26
@@ -111,7 +110,9 @@ typedef struct _soundtypes {
     int         corpus_ready;
     double     *filterbank;
     double      samplerate;
-    double      threshold;      // NEW: energy threshold
+    double      threshold;     // mic energy gate
+    double      sensitivity;   // peak picking threshold (0-1)
+    double      minlength_ms;  // minimum segment length in ms
     void       *outlet_pos;
     void       *outlet_info;
 } t_soundtypes;
@@ -122,7 +123,9 @@ void soundtypes_assist(t_soundtypes *x, void *b, long m, long a, char *s);
 void soundtypes_bang(t_soundtypes *x);
 void soundtypes_set(t_soundtypes *x, t_symbol *s);
 void soundtypes_clusters(t_soundtypes *x, long n);
-void soundtypes_threshold(t_soundtypes *x, double f);  // NEW
+void soundtypes_threshold(t_soundtypes *x, double f);
+void soundtypes_sensitivity(t_soundtypes *x, double f);   // NEW
+void soundtypes_minlength(t_soundtypes *x, double f);     // NEW
 void soundtypes_dsp64(t_soundtypes *x, t_object *dsp64, short *count, double samplerate, long maxvectorsize, long flags);
 void soundtypes_perform64(t_soundtypes *x, t_object *dsp64, double **ins, long numins, double **outs, long numouts, long sampleframes, long flags, void *userparam);
 
@@ -135,12 +138,14 @@ void ext_main(void *r) {
                   (method)soundtypes_free,
                   sizeof(t_soundtypes),
                   0L, A_GIMME, 0);
-    class_addmethod(c, (method)soundtypes_bang,      "bang",      0);
-    class_addmethod(c, (method)soundtypes_set,       "set",       A_SYM,   0);
-    class_addmethod(c, (method)soundtypes_clusters,  "clusters",  A_LONG,  0);
-    class_addmethod(c, (method)soundtypes_threshold, "threshold", A_FLOAT, 0);  // NEW
-    class_addmethod(c, (method)soundtypes_assist,    "assist",    A_CANT,  0);
-    class_addmethod(c, (method)soundtypes_dsp64,     "dsp64",     A_CANT,  0);
+    class_addmethod(c, (method)soundtypes_bang,        "bang",        0);
+    class_addmethod(c, (method)soundtypes_set,         "set",         A_SYM,   0);
+    class_addmethod(c, (method)soundtypes_clusters,    "clusters",    A_LONG,  0);
+    class_addmethod(c, (method)soundtypes_threshold,   "threshold",   A_FLOAT, 0);
+    class_addmethod(c, (method)soundtypes_sensitivity, "sensitivity", A_FLOAT, 0);  // NEW
+    class_addmethod(c, (method)soundtypes_minlength,   "minlength",   A_FLOAT, 0);  // NEW
+    class_addmethod(c, (method)soundtypes_assist,      "assist",      A_CANT,  0);
+    class_addmethod(c, (method)soundtypes_dsp64,       "dsp64",       A_CANT,  0);
     class_dspinit(c);
     class_register(CLASS_BOX, c);
     soundtypes_class = c;
@@ -160,7 +165,9 @@ void *soundtypes_new(t_symbol *s, long argc, t_atom *argv) {
         x->num_segments = 0;
         x->corpus_ready = 0;
         x->samplerate   = 44100.0;
-        x->threshold    = 0.01;   // NEW: default threshold
+        x->threshold    = 0.01;
+        x->sensitivity  = 0.25;   // NEW: default (same as old PEAK_THRESH)
+        x->minlength_ms = 200.0;  // NEW: default 200ms minimum segment
         x->filterbank   = (double *)malloc(N_FILTERS * (FFT_SIZE/2+1) * sizeof(double));
         build_mel_filterbank(x->filterbank, x->samplerate);
         x->outlet_info  = outlet_new((t_object *)x, NULL);
@@ -181,7 +188,7 @@ void soundtypes_free(t_soundtypes *x) {
 
 void soundtypes_assist(t_soundtypes *x, void *b, long m, long a, char *s) {
     if (m == ASSIST_INLET)
-        sprintf(s, "signal: live audio | bang: analyse | set <buffer> | clusters <n> | threshold <f>");
+        sprintf(s, "signal: live audio | bang: analyse | set <buffer> | clusters <n> | threshold <f> | sensitivity <f> | minlength <ms>");
     else if (a == 0)
         sprintf(s, "matched segment: start_sample end_sample");
     else
@@ -199,11 +206,23 @@ void soundtypes_clusters(t_soundtypes *x, long n) {
     post("soundtypes~: clusters set to %ld", n);
 }
 
-// NEW: set energy threshold
 void soundtypes_threshold(t_soundtypes *x, double f) {
     if (f < 0.0) f = 0.0;
     x->threshold = f;
     post("soundtypes~: threshold set to %.4f", f);
+}
+
+void soundtypes_sensitivity(t_soundtypes *x, double f) {
+    if (f < 0.0) f = 0.0;
+    if (f > 1.0) f = 1.0;
+    x->sensitivity = f;
+    post("soundtypes~: sensitivity set to %.3f (re-analyse to apply)", f);
+}
+
+void soundtypes_minlength(t_soundtypes *x, double f) {
+    if (f < 0.0) f = 0.0;
+    x->minlength_ms = f;
+    post("soundtypes~: minlength set to %.1f ms (re-analyse to apply)", f);
 }
 
 void soundtypes_bang(t_soundtypes *x) {
@@ -233,6 +252,10 @@ void soundtypes_bang(t_soundtypes *x) {
         x->samplerate = sr;
         build_mel_filterbank(x->filterbank, sr);
     }
+
+    // minimum segment length in frames
+    long min_frames = (long)((x->minlength_ms / 1000.0) * sr / HOP_SIZE);
+    if (min_frames < 1) min_frames = 1;
 
     double *mono = (double *)malloc(num_samples * sizeof(double));
     long i;
@@ -287,20 +310,27 @@ void soundtypes_bang(t_soundtypes *x) {
     int  num_peaks = 0;
     peak_list[num_peaks++] = 0;
 
+    int last_peak = 0;
     for (frame = PEAK_WINDOW; frame < num_frames - PEAK_WINDOW; frame++) {
-        if (flux[frame] < PEAK_THRESH * max_flux) continue;
+        // sensitivity controls the threshold
+        if (flux[frame] < x->sensitivity * max_flux) continue;
+
         int is_peak = 1, w;
         for (w = -PEAK_WINDOW; w <= PEAK_WINDOW; w++) {
             if (w == 0) continue;
             if (flux[frame + w] >= flux[frame]) { is_peak = 0; break; }
         }
-        if (is_peak && num_peaks < MAX_SEGMENTS)
+
+        // minlength check — skip if too close to last peak
+        if (is_peak && (frame - last_peak) >= min_frames && num_peaks < MAX_SEGMENTS) {
             peak_list[num_peaks++] = frame;
+            last_peak = frame;
+        }
     }
     free(flux);
 
     if (num_peaks < 2) {
-        object_error((t_object *)x, "not enough segments found");
+        object_error((t_object *)x, "not enough segments — try lower sensitivity or shorter minlength");
         free(mono); free(frame_mfcc); free(peak_list);
         return;
     }
@@ -381,8 +411,8 @@ void soundtypes_bang(t_soundtypes *x) {
 
     x->num_segments = num_peaks;
     x->corpus_ready = 1;
-    post("soundtypes~: corpus ready — %d segments, %d clusters, %d iterations",
-         num_peaks, K, iter);
+    post("soundtypes~: corpus ready — %d segments, %d clusters, %d iterations (sensitivity=%.2f minlength=%.0fms)",
+         num_peaks, K, iter, x->sensitivity, x->minlength_ms);
     free(peak_list);
 }
 
@@ -412,14 +442,12 @@ void soundtypes_perform64(t_soundtypes *x, t_object *dsp64, double **ins, long n
             live_hop_count++;
             if (live_hop_count % 2 != 0) continue;
 
-            // NEW: compute RMS energy of this hop
             double rms = 0.0;
             int i;
             for (i = 0; i < HOP_SIZE; i++)
                 rms += live_buf[i] * live_buf[i];
             rms = sqrt(rms / HOP_SIZE);
 
-            // NEW: skip matching if below threshold
             if (rms < x->threshold) return;
 
             double re[FFT_SIZE], im[FFT_SIZE];
